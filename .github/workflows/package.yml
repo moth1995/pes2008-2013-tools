@@ -3,7 +3,7 @@ name: Package add-ons
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
+    tags: ["anm-v*", "ktmdl-v*"]
   pull_request:
   workflow_dispatch:
 
@@ -11,15 +11,38 @@ permissions:
   contents: read
 
 jobs:
+  prepare:
+    name: Select add-ons to package
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Pick matrix from tag prefix
+        id: select
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          case "$REF" in
+            refs/tags/anm-v*)
+              matrix='{"addon":["pes_anm_importer"]}' ;;
+            refs/tags/ktmdl-v*)
+              matrix='{"addon":["pes_ktmdl_importer"]}' ;;
+            refs/tags/*)
+              echo "::error::Tags must start with 'anm-v' or 'ktmdl-v', got '$REF'" >&2
+              exit 1 ;;
+            *)
+              matrix='{"addon":["pes_anm_importer","pes_ktmdl_importer"]}' ;;
+          esac
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
   package:
     name: Package ${{ matrix.addon }}
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        addon:
-          - pes_anm_importer
-          - pes_ktmdl_importer
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,6 +67,19 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify tag matches bl_info version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          expected="${TAG#*-v}"
+          actual="${{ steps.meta.outputs.version }}"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Tag '$TAG' expects version '$expected' but ${{ matrix.addon }}/__init__.py has '$actual'" >&2
+            exit 1
+          fi
+
       - name: Zip add-on
         shell: bash
         run: |
@@ -60,7 +96,7 @@ jobs:
 
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     needs: package
     runs-on: ubuntu-latest
     permissions:
@@ -76,5 +112,6 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ github.ref_name }}
           files: dist/*.zip
           generate_release_notes: true
