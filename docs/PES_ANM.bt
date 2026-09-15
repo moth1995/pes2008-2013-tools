@@ -1,0 +1,946 @@
+// PES / Konami ANM Binary Template
+// 010 Editor
+//
+// Reverse engineered from the supplied PES 2013 samples:
+//   - cl_cup_ribbon_anim_01.anm
+//   - unnamed_0.anm (player body / goal-demo animation)
+//
+// Cross-checked against:
+//   - cl_cup_ribbon.ktmdl
+//   - the 19-bone PES 2013 body KTMDLs
+//   - PES 2008 IDA type information
+//   - archived Konami Dance Evolution KTMDL/ANM reverse engineering
+//
+// ---------------------------------------------------------------------------
+// IMPORTANT TERMINOLOGY UPDATE FROM THE IDA TYPES
+// ---------------------------------------------------------------------------
+//
+// The IDA dump exposes Konami's runtime animation structures:
+//
+//   ktAnimData
+//     cnt
+//     tracks
+//     boneInfo
+//
+//   ktAnimDataBoneInfo
+//     count
+//     connect
+//
+//   ktAnimTrack
+//     id
+//     count
+//     curveSets
+//
+//   ktAnimCurveSet
+//     id
+//     frameRatio
+//     totalFrame
+//     numCurves
+//     stride
+//     curves
+//
+//   ktAnimCurve
+//     nKeys
+//     curveType
+//     curveChannel
+//     offset
+//     times
+//     values
+//
+// The exact disk structures are not byte-for-byte copies of those runtime
+// structures, but several fields map cleanly.
+//
+// Most importantly, the serialized 0x10-byte curve header is now interpreted as:
+//
+//   +0x00 uint16 valueFormat       (disk-only codec/value format ID)
+//   +0x02 uint8  curveType         (Konami runtime field name)
+//   +0x03 uint8  curveChannel      (Konami runtime field name)
+//   +0x04 uint16 nKeys             (Konami runtime field name)
+//   +0x06 uint16 targetNo          (bone index in supplied skeletal ANMs)
+//   +0x08 uint32 timesOffset       (disk relative form of runtime "times")
+//   +0x0C uint32 valuesOffset      (disk relative form of runtime "values")
+//
+// Therefore our older name "storageMode" was wrong:
+//   curveType 0 = sparse/keyed in the supplied ribbon
+//   curveType 3 = dense/per-frame in both supplied animations
+//
+// valueFormat observed:
+//   0x1C = packed 48-bit quaternion rotation
+//   0x1D = raw float3 local translation
+//   0x1F = base float3 + half3 delta local translation
+//
+// The runtime anmBone structure contains m_qLocal/m_vLocal and m_qWorld/m_vWorld.
+// Comparison against the body KTMDL confirms the ANM curves are ABSOLUTE LOCAL
+// bone transforms, not bind-pose deltas.
+//
+// ---------------------------------------------------------------------------
+// CHUNKS OBSERVED
+// ---------------------------------------------------------------------------
+//
+// 0xFF010001 : root/core header
+// 0xFF010003 : serialized bone-info/connectivity chunk
+// 0xFF010002 : serialized curve-data chunk
+//
+// Ribbon:
+//   core at 0
+//   49 bones
+//   totalFrame = 450
+//   451 dense samples when dense
+//
+// Player body:
+//   anmPlInfo0::PL_ANIME_INFO at 0
+//   offset_move  = 0x005C
+//   offset_clani = 0x0330 -> anmSeqHeader_t
+//   offset_anime = 0x03C0 -> FF010001 core
+//   type         = 0x1B = ANM_TYPE_GOAL_DEMO
+//   19 bones
+//   totalFrame = 90
+//   91 dense samples
+//   sequence FPS = 30
+//
+// ---------------------------------------------------------------------------
+// QUATERNION PACKING
+// ---------------------------------------------------------------------------
+//
+// Packed rotation values are 6 bytes / 48 bits.
+//
+// PES/Konami "smallest-three" layout validated against the ribbon sample:
+//
+//   bit 47       reserved/zero in every observed sample
+//   bits 46..32  stored component 0 (15-bit unsigned)
+//   bits 31..17  stored component 1 (15-bit unsigned)
+//   bits 16..2   stored component 2 (15-bit unsigned)
+//   bits 1..0    omitted/largest component index
+//
+// omitted index:
+//   0 = X
+//   1 = Y
+//   2 = Z
+//   3 = W
+//
+// quantization:
+//   component = (raw15 - 16383.5) / 23169.767578125
+//
+// missing component:
+//   sqrt(1 - a*a - b*b - c*c)
+//
+// identity:
+//   integer    0x3FFF7FFEFFFF
+//   file bytes FF FF FE 7F FF 3F
+//
+// ---------------------------------------------------------------------------
+// PLAYER SEQUENCE TYPES CONFIRMED BY THE IDA DUMP
+// ---------------------------------------------------------------------------
+//
+// anmSeqHeader_t:
+//   m_iVersion
+//   m_iBundleOfs
+//   m_iFps
+//   m_iNumTracks
+//   m_iTrackOfs[]
+//
+// anmSeqTrack_t:
+//   m_pEventOfs
+//   m_iNumChannels
+//   m_aNumEvents[]
+//
+// The supplied body animation has version 0x20070306, 30 FPS, 3 tracks.
+// Each supplied track has one channel and exactly two 16-byte events.
+// Those 16-byte records match anmSeq3BasEvent_t exactly.
+//
+// Other IDA-defined event layouts are included below for future samples:
+//   anmSeqOldEvent_t  = 8 bytes
+//   anmSeq3BasEvent_t = 16 bytes
+//   anmSeq3AddEvent_t = 18 bytes
+//
+// ---------------------------------------------------------------------------
+//
+// 010 Editor 16+ recommended because hfloat is used.
+//
+// ---------------------------------------------------------------------------
+
+#define ANM_MAGIC_FILE       0xFF010001
+#define ANM_MAGIC_BONEINFO   0xFF010003
+#define ANM_MAGIC_CURVEDATA  0xFF010002
+
+// Serialized value/codec formats observed.
+#define ANM_VALUE_QUAT48                    0x001C
+#define ANM_VALUE_TRANSLATION_FLOAT3        0x001D
+#define ANM_VALUE_TRANSLATION_BASE_HALF3    0x001F
+
+// ktAnimCurve.curveType values observed.
+#define KT_ANIM_CURVE_SPARSE  0
+#define KT_ANIM_CURVE_DENSE   3
+
+// anmPlInfo::anmType_t
+#define ANM_TYPE_MOVE          0x00
+#define ANM_TYPE_MOVE_KANI     0x01
+#define ANM_TYPE_MOVE_HEISOU   0x02
+#define ANM_TYPE_MOVE_STOP     0x03
+#define ANM_TYPE_MOVE_TURN     0x04
+#define ANM_TYPE_KICK_STOP     0x05
+#define ANM_TYPE_KICK_RUN      0x06
+#define ANM_TYPE_JUMP          0x07
+#define ANM_TYPE_TRAP_STOP     0x08
+#define ANM_TYPE_TRAP_RUN      0x09
+#define ANM_TYPE_TRAP_SIDE     0x0A
+#define ANM_TYPE_HEAD          0x0B
+#define ANM_TYPE_HEADJ         0x0C
+#define ANM_TYPE_DRIBBLE       0x0D
+#define ANM_TYPE_DRIBBLE_TURN  0x0E
+#define ANM_TYPE_BLOCK         0x0F
+#define ANM_TYPE_KABE          0x10
+#define ANM_TYPE_FEINT         0x11
+#define ANM_TYPE_TACKLE        0x12
+#define ANM_TYPE_SLIDING       0x13
+#define ANM_TYPE_YOROKE        0x14
+#define ANM_TYPE_KOROBI        0x15
+#define ANM_TYPE_OKI           0x16
+#define ANM_TYPE_ITAGARI       0x17
+#define ANM_TYPE_KEEPER        0x18
+#define ANM_TYPE_EDIT          0x19
+#define ANM_TYPE_OTHER         0x1A
+#define ANM_TYPE_GOAL_DEMO     0x1B
+#define ANM_TYPE_OUT_OF_PLAY   0x1C
+#define ANM_TYPE_ENTER         0x1D
+#define ANM_TYPE_END_DEMO      0x1E
+#define ANM_TYPE_HALFTIME      0x1F
+#define ANM_TYPE_PK            0x20
+#define ANM_TYPE_FOUL          0x21
+#define ANM_TYPE_TAC_DEMO      0x22
+
+// anmSeqEvent::channelKind_t
+#define ANM_SEQ_EVENT_NON  0
+#define ANM_SEQ_EVENT_OLD  1
+#define ANM_SEQ_EVENT_BAS  2
+#define ANM_SEQ_EVENT_ADD  3
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+ushort ReadUInt16LEAt( int64 p )
+{
+    return (ushort)(
+        ((uint)ReadUByte(p + 0)     ) |
+        ((uint)ReadUByte(p + 1) << 8)
+    );
+}
+
+uint ReadUInt32LEAt( int64 p )
+{
+    return ((uint)ReadUByte(p + 0)      ) |
+           ((uint)ReadUByte(p + 1) <<  8) |
+           ((uint)ReadUByte(p + 2) << 16) |
+           ((uint)ReadUByte(p + 3) << 24);
+}
+
+// ---------------------------------------------------------------------------
+// PES player metadata (IDA-confirmed)
+//
+// This exact PES 2008 structure matches the first 0x38 bytes of the supplied
+// PES 2013 unnamed_0.anm.
+//
+// Only this PL_ANIME_INFO variant is instantiated because it is the one for
+// which we have a binary sample.
+// ---------------------------------------------------------------------------
+
+typedef union
+{
+    struct
+    {
+        ubyte loop_num;
+        ubyte demo_num;
+    };
+
+    ushort offset_ik;
+} anmPlInfo0_IkOrLoopDemo;
+
+typedef struct
+{
+    ubyte loop;
+    ubyte detail;
+    ubyte ball;
+    ubyte type;                         // anmPlInfo::anmType_t
+
+    ubyte B_model;
+    ubyte hanyou;
+    ubyte foul_point;
+    ubyte connect_type;
+
+    ubyte max_speed_ball;
+    ubyte faceAnime;
+    ubyte handAnime;
+    ubyte reserved0;
+
+    anmPlInfo0_IkOrLoopDemo ikOrLoopDemo;
+
+    ubyte rot_num;
+    ubyte rot_mode;
+
+    short rot_angle;
+
+    ushort max_speed;
+    ushort ball_range0;
+    ushort ball_range1;
+
+    ushort jump_s;
+    ushort jump_e;
+
+    ushort ball_s;
+    ushort ball_e;
+
+    ushort connect;
+    ushort rate;
+    ushort hit_frame;
+    ushort maya_move_mode;
+
+    ushort offset_hold;
+    ushort offset_loop;
+    ushort offset_rot;
+    ushort offset_demo;
+    ushort offset_ball;
+    ushort offset_clani;
+    ushort offset_anime;
+    ushort offset_move;
+} anmPlInfo0_PL_ANIME_INFO;             // 0x38
+
+// ---------------------------------------------------------------------------
+// Player sequence data (IDA-confirmed)
+// ---------------------------------------------------------------------------
+
+typedef struct
+{
+    uint m_iVersion;
+    uint m_iBundleOfs;
+
+    ushort m_iFps;
+    ushort m_iNumTracks;
+
+    ushort m_iTrackOfs[m_iNumTracks];
+} anmSeqHeader_t;
+
+typedef struct
+{
+    ushort m_pEventOfs;                 // track-relative
+    ushort m_iNumChannels;
+    ushort m_aNumEvents[m_iNumChannels];
+} anmSeqTrack_t;
+
+typedef struct
+{
+    ushort m_iBegin;
+    ushort m_iEnd;
+    ushort m_iType;
+    ushort m_iBlendTerm;
+} anmSeqOldEvent_t;                     // 0x08
+
+typedef struct
+{
+    ushort m_iType;
+    ushort m_iStartFrame;
+    ushort m_iEndFrame;
+    ushort m_iSourceStartFrame;
+    ushort m_iSourceEndFrame;
+    ushort m_iBlendKind;
+    ushort m_iBlendTerm;
+    ushort m_iScale;
+} anmSeq3BasEvent_t;                    // 0x10
+
+typedef struct
+{
+    ushort m_iType;
+    ushort m_iStartFrame;
+    ushort m_iEndFrame;
+    ushort m_iSourceStartFrame;
+    ushort m_iSourceEndFrame;
+    ushort m_iScale;
+    ushort m_iMaxWeight;
+    ushort m_iFadeIn;
+    ushort m_iFadeOut;
+} anmSeq3AddEvent_t;                    // 0x12
+
+// ---------------------------------------------------------------------------
+// Serialized ANM core.
+//
+// Names ending in "Disk" are our serialized representations. Konami's runtime
+// types use pointers instead of the relative offsets seen here.
+// ---------------------------------------------------------------------------
+
+typedef struct
+{
+    uint magic;                         // FF010001
+
+    ushort totalFrame;                  // highest frame index in supplied files
+                                        // ribbon 450, body 90
+    ubyte unknown06;                    // ribbon 1, body 0
+    ubyte unknown07;                    // 0 in both supplied samples
+
+    uint unknown08;                     // 0
+    uint unknown0C;                     // 0
+
+    uint boneInfoOffset;                // -> FF010003
+    uint curveDataOffset;               // -> FF010002
+
+    uint unknown18;                     // 0
+} ktAnimDataDiskHeader;                 // 0x1C
+
+// Runtime ktAnimDataBoneInfo is:
+//     uint16 count;
+//     uint16 *connect;
+//
+// The disk version stores a 32-bit count and an offset to packed 16-bit
+// connectivity entries.
+typedef struct
+{
+    uint magic;                         // FF010003
+    uint count;
+
+    uint connectOffset;                 // 0x10
+    uint chunkSize;                     // 0x10 + count*2 in supplied files
+} ktAnimDataBoneInfoDisk;               // 0x10
+
+// One serialized uint16 from runtime boneInfo->connect.
+// Low byte is the bone number; high byte is signed parent number.
+typedef struct
+{
+    ubyte boneNo;
+    byte parentNo;                      // FF = -1
+} ktAnimBoneConnectDisk;                // 0x02
+
+typedef struct
+{
+    uint magic;                         // FF010002
+    uint unknown04;                     // 0 in supplied files
+
+    uint curveOffsetTableEnd;           // relative to this chunk;
+                                        // first byte after the offset table
+} ktAnimCurveDataDiskHeader;            // 0x0C
+
+// Serialized curve.
+//
+// curveType / curveChannel / nKeys / times / values terminology comes from the
+// runtime ktAnimCurve structure.
+//
+// valueFormat and targetNo are fields of this disk serialization.
+typedef struct
+{
+    ushort valueFormat;                 // 1C / 1D / 1F observed
+
+    ubyte curveType;                    // 0 sparse, 3 dense observed
+    ubyte curveChannel;                 // 0 in all supplied skeletal curves
+
+    ushort nKeys;
+    ushort targetNo;                    // bone number in supplied skeletal ANMs
+
+    uint timesOffset;                   // curve-relative; 0 for dense curves
+    uint valuesOffset;                  // curve-relative
+} ktAnimCurveDiskHeader;                // 0x10
+
+// ---------------------------------------------------------------------------
+// Packed quaternion
+// ---------------------------------------------------------------------------
+
+typedef struct
+{
+    ushort word0;
+    ushort word1;
+    ushort word2;
+} ktAnimPackedQuat48 <read=ktAnimPackedQuat48Read>; // 6 bytes
+
+string ktAnimPackedQuat48Read( ktAnimPackedQuat48 &r )
+{
+    local uint64 bits =
+        (uint64)r.word0 |
+        ((uint64)r.word1 << 16) |
+        ((uint64)r.word2 << 32);
+
+    local int missingIndex = (int)(bits & 3);
+
+    local uint raw0 = (uint)((bits >> 32) & 0x7FFF);
+    local uint raw1 = (uint)((bits >> 17) & 0x7FFF);
+    local uint raw2 = (uint)((bits >>  2) & 0x7FFF);
+
+    local double a = ((double)raw0 - 16383.5) / 23169.767578125;
+    local double b = ((double)raw1 - 16383.5) / 23169.767578125;
+    local double c = ((double)raw2 - 16383.5) / 23169.767578125;
+
+    local double missing =
+        Sqrt(Max(0.0, 1.0 - (a*a + b*b + c*c)));
+
+    local double x = 0.0;
+    local double y = 0.0;
+    local double z = 0.0;
+    local double w = 0.0;
+
+    if (missingIndex == 0)
+    {
+        x = missing;
+        y = a;
+        z = b;
+        w = c;
+    }
+    else if (missingIndex == 1)
+    {
+        x = a;
+        y = missing;
+        z = b;
+        w = c;
+    }
+    else if (missingIndex == 2)
+    {
+        x = a;
+        y = b;
+        z = missing;
+        w = c;
+    }
+    else
+    {
+        x = a;
+        y = b;
+        z = c;
+        w = missing;
+    }
+
+    return Str(
+        "q=(%.6f, %.6f, %.6f, %.6f) omitted=%d",
+        x, y, z, w, missingIndex
+    );
+}
+
+typedef struct
+{
+    float x;
+    float y;
+    float z;
+} ktAnimFloat3Disk;
+
+typedef struct
+{
+    hfloat x;
+    hfloat y;
+    hfloat z;
+} ktAnimHalf3Disk;                      // 6 bytes
+
+// ---------------------------------------------------------------------------
+// Serialized curve body
+// ---------------------------------------------------------------------------
+
+typedef struct
+{
+    local int64 curveBase = FTell();
+    local int64 currentRel;
+    local int alignmentSize;
+
+    ktAnimCurveDiskHeader header;
+
+    // Sparse/keyed curves.
+    //
+    // Ribbon constant rotations:
+    //   nKeys = 2
+    //   times = {0, 450}
+    //
+    // Dense curves:
+    //   timesOffset = 0
+    //   nKeys = totalFrame + 1
+    if (header.timesOffset != 0)
+    {
+        currentRel = FTell() - curveBase;
+
+        if (header.timesOffset > currentRel)
+            ubyte preTimesData[header.timesOffset - currentRel];
+
+        ushort times[header.nKeys];
+
+        currentRel = FTell() - curveBase;
+
+        if (header.valuesOffset > currentRel)
+            ubyte preValuesData[header.valuesOffset - currentRel];
+    }
+    else
+    {
+        currentRel = FTell() - curveBase;
+
+        if (header.valuesOffset > currentRel)
+            ubyte preValuesData[header.valuesOffset - currentRel];
+    }
+
+    if (header.valueFormat == ANM_VALUE_QUAT48)
+    {
+        ktAnimPackedQuat48 values[header.nKeys];
+    }
+    else if (header.valueFormat == ANM_VALUE_TRANSLATION_FLOAT3)
+    {
+        ktAnimFloat3Disk values[header.nKeys];
+    }
+    else if (header.valueFormat == ANM_VALUE_TRANSLATION_BASE_HALF3)
+    {
+        // Strongly validated reconstruction:
+        //     localTranslation = baseTranslation + delta[key]
+        ktAnimFloat3Disk baseTranslation;
+        ktAnimHalf3Disk delta[header.nKeys];
+    }
+    else
+    {
+        Warning("Unknown serialized ANM valueFormat; curve payload left undecoded.");
+    }
+
+    // Every supplied curve ends at a 0x10 absolute file alignment.
+    alignmentSize = (int)((16 - (FTell() % 16)) % 16);
+
+    if (alignmentSize > 0)
+        ubyte alignment[alignmentSize];
+
+} ktAnimCurveDisk;
+
+// ---------------------------------------------------------------------------
+// Detection helpers
+// ---------------------------------------------------------------------------
+
+int IsValidatedANMCoreAt( int64 p )
+{
+    local uint boneOffset;
+    local uint curveOffset;
+
+    if (p < 0 || p + 0x1C > FileSize())
+        return 0;
+
+    if (ReadUInt32LEAt(p) != ANM_MAGIC_FILE)
+        return 0;
+
+    boneOffset  = ReadUInt32LEAt(p + 0x10);
+    curveOffset = ReadUInt32LEAt(p + 0x14);
+
+    if (p + boneOffset + 4 > FileSize())
+        return 0;
+
+    if (p + curveOffset + 4 > FileSize())
+        return 0;
+
+    if (ReadUInt32LEAt(p + boneOffset) != ANM_MAGIC_BONEINFO)
+        return 0;
+
+    if (ReadUInt32LEAt(p + curveOffset) != ANM_MAGIC_CURVEDATA)
+        return 0;
+
+    return 1;
+}
+
+int64 FindANMCore()
+{
+    local int64 p;
+
+    for (p = 0; p + 0x1C <= FileSize(); p++)
+    {
+        if (IsValidatedANMCoreAt(p))
+            return p;
+    }
+
+    return -1;
+}
+
+// Exact supplied player-body wrapper detector.
+//
+// anmPlInfo0::PL_ANIME_INFO.offset_anime is at +0x34.
+int IsPlayerInfo0AtFileStart()
+{
+    local ushort animationOffset;
+
+    if (FileSize() < 0x38)
+        return 0;
+
+    animationOffset = ReadUInt16LEAt(0x34);
+
+    if (animationOffset == 0)
+        return 0;
+
+    return IsValidatedANMCoreAt(animationOffset);
+}
+
+int64 FindSequenceHeader( int64 coreBase )
+{
+    local int64 p;
+    local int fps;
+    local int nTracks;
+    local int headerSize;
+    local int i;
+    local ushort prevOffset;
+    local ushort curOffset;
+
+    for (p = 0; p + 14 <= coreBase; p += 2)
+    {
+        fps = ReadUInt16LEAt(p + 8);
+        nTracks = ReadUInt16LEAt(p + 10);
+
+        if (fps <= 0 || fps > 240)
+            continue;
+
+        if (nTracks <= 0 || nTracks > 32)
+            continue;
+
+        headerSize = 12 + nTracks * 2;
+
+        if (p + headerSize > coreBase)
+            continue;
+
+        if (ReadUInt16LEAt(p + 12) != headerSize)
+            continue;
+
+        prevOffset = 0;
+
+        for (i = 0; i < nTracks; i++)
+        {
+            curOffset = ReadUInt16LEAt(p + 12 + i * 2);
+
+            if (curOffset < headerSize)
+                break;
+
+            if (i > 0 && curOffset <= prevOffset)
+                break;
+
+            if (p + curOffset + 6 > coreBase)
+                break;
+
+            prevOffset = curOffset;
+        }
+
+        if (i == nTracks)
+            return p;
+    }
+
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Parse
+// ---------------------------------------------------------------------------
+
+LittleEndian();
+
+local int64 anmBase = -1;
+local int64 seqBase = -1;
+local int hasPlayerInfo0 = 0;
+
+local int i;
+local int j;
+
+if (IsPlayerInfo0AtFileStart())
+{
+    hasPlayerInfo0 = 1;
+
+    FSeek(0);
+    anmPlInfo0_PL_ANIME_INFO playerInfo;
+
+    anmBase = playerInfo.offset_anime;
+
+    if (playerInfo.offset_clani > 0 &&
+        playerInfo.offset_clani < anmBase)
+    {
+        seqBase = playerInfo.offset_clani;
+    }
+
+    // PES 2013 contains 0x24 bytes between the PES 2008-sized PL_ANIME_INFO
+    // and offset_move in this sample. Their structure is not present in the
+    // supplied IDA type dump, so preserve them instead of inventing fields.
+    if (playerInfo.offset_move > 0 &&
+        playerInfo.offset_move > FTell())
+    {
+        ubyte playerInfoExtendedData[
+            playerInfo.offset_move - FTell()
+        ];
+    }
+
+    // offset_move is an official field name, but no matching serialized move
+    // structure was found in the type dump. Expose the block raw.
+    if (playerInfo.offset_move > 0)
+    {
+        local int64 moveEnd = anmBase;
+
+        if (seqBase > playerInfo.offset_move && seqBase < moveEnd)
+            moveEnd = seqBase;
+
+        if (moveEnd > playerInfo.offset_move)
+        {
+            FSeek(playerInfo.offset_move);
+            ubyte moveDataRaw[moveEnd - playerInfo.offset_move];
+        }
+    }
+}
+else
+{
+    anmBase = FindANMCore();
+}
+
+if (anmBase < 0)
+{
+    Warning("Could not find a validated PES/Konami FF010001 ANM core.");
+    return;
+}
+
+// Fallback sequence search if there was no player-info pointer.
+if (seqBase < 0 && anmBase > 0)
+    seqBase = FindSequenceHeader(anmBase);
+
+// Unknown bytes before sequence/core for variants we cannot type yet.
+if (!hasPlayerInfo0 && anmBase > 0)
+{
+    local int64 unknownEnd = anmBase;
+
+    if (seqBase >= 0 && seqBase < unknownEnd)
+        unknownEnd = seqBase;
+
+    if (unknownEnd > 0)
+    {
+        FSeek(0);
+        ubyte unknownBeforeKnownData[unknownEnd];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sequence
+// ---------------------------------------------------------------------------
+
+if (seqBase >= 0)
+{
+    FSeek(seqBase);
+    anmSeqHeader_t sequence;
+
+    local int seqTrackIndex;
+    local int channelIndex;
+    local int totalEvents;
+    local int64 seqTrackEnd;
+    local int64 eventStart;
+
+    for (seqTrackIndex = 0;
+         seqTrackIndex < sequence.m_iNumTracks;
+         seqTrackIndex++)
+    {
+        FSeek(seqBase + sequence.m_iTrackOfs[seqTrackIndex]);
+
+        local int64 seqTrackBase = FTell();
+        anmSeqTrack_t sequenceTrack;
+
+        totalEvents = 0;
+
+        for (channelIndex = 0;
+             channelIndex < sequenceTrack.m_iNumChannels;
+             channelIndex++)
+        {
+            totalEvents += sequenceTrack.m_aNumEvents[channelIndex];
+        }
+
+        eventStart = seqTrackBase + sequenceTrack.m_pEventOfs;
+
+        if (seqTrackIndex + 1 < sequence.m_iNumTracks)
+            seqTrackEnd = seqBase + sequence.m_iTrackOfs[seqTrackIndex + 1];
+        else
+            seqTrackEnd = anmBase;
+
+        FSeek(eventStart);
+
+        // The supplied 0x20070306 player sequence is one BAS channel per track
+        // and the binary records match anmSeq3BasEvent_t exactly.
+        if (sequence.m_iVersion == 0x20070306 &&
+            sequenceTrack.m_iNumChannels == 1 &&
+            totalEvents > 0 &&
+            eventStart + totalEvents * 0x10 <= seqTrackEnd)
+        {
+            anmSeq3BasEvent_t baseEvents[totalEvents];
+
+            if (FTell() < seqTrackEnd)
+                ubyte sequenceTrackPadding[seqTrackEnd - FTell()];
+        }
+        else if (seqTrackEnd > eventStart)
+        {
+            // Future/other sequence variants may use OLD or ADD records or
+            // multiple mixed channels. Preserve raw bytes until we have a sample.
+            ubyte sequenceEventsRaw[seqTrackEnd - eventStart];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FF010001 root
+// ---------------------------------------------------------------------------
+
+FSeek(anmBase);
+ktAnimDataDiskHeader animation;
+
+if (animation.magic != ANM_MAGIC_FILE)
+{
+    Warning("Unexpected ANM core magic.");
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// FF010003 bone info
+// ---------------------------------------------------------------------------
+
+FSeek(anmBase + animation.boneInfoOffset);
+
+local int64 boneInfoBase = FTell();
+ktAnimDataBoneInfoDisk boneInfo;
+
+if (boneInfo.magic != ANM_MAGIC_BONEINFO)
+    Warning("Unexpected bone-info chunk magic.");
+
+FSeek(boneInfoBase + boneInfo.connectOffset);
+ktAnimBoneConnectDisk connect[boneInfo.count];
+
+// Padding from logical bone-info size to the curve-data chunk.
+local int64 boneInfoLogicalEnd =
+    boneInfoBase + boneInfo.chunkSize;
+
+local int64 curveDataAbsolute =
+    anmBase + animation.curveDataOffset;
+
+if (curveDataAbsolute > boneInfoLogicalEnd)
+{
+    FSeek(boneInfoLogicalEnd);
+    ubyte boneInfoAlignment[
+        curveDataAbsolute - boneInfoLogicalEnd
+    ];
+}
+
+// ---------------------------------------------------------------------------
+// FF010002 curve data
+// ---------------------------------------------------------------------------
+
+FSeek(curveDataAbsolute);
+
+local int64 curveDataBase = FTell();
+ktAnimCurveDataDiskHeader curveData;
+
+if (curveData.magic != ANM_MAGIC_CURVEDATA)
+    Warning("Unexpected curve-data chunk magic.");
+
+// Curve offset table.
+// Both supplied samples terminate with one zero entry.
+local int curveOffsetCount =
+    (curveData.curveOffsetTableEnd - 0x0C) / 4;
+
+uint curveOffsets[curveOffsetCount];
+
+// Special root-bone rotation.
+//
+// In both supplied skeletal animations, the curve immediately after the
+// offset table is target 0 rotation and is not referenced by curveOffsets[].
+// Ribbon stores it sparse; body stores it dense.
+FSeek(curveDataBase + curveData.curveOffsetTableEnd);
+
+if (ReadUInt16LEAt(FTell()) == ANM_VALUE_QUAT48)
+{
+    ktAnimCurveDisk rootRotationCurve;
+}
+
+// Referenced curves.
+for (i = 0; i < curveOffsetCount; i++)
+{
+    if (curveOffsets[i] == 0)
+        continue;
+
+    FSeek(curveDataBase + curveOffsets[i]);
+    ktAnimCurveDisk curve;
+}
+
+FSeek(FileSize());

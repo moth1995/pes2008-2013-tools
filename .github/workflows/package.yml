@@ -1,0 +1,80 @@
+name: Package add-ons
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.addon }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        addon:
+          - pes_anm_importer
+          - pes_ktmdl_importer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Syntax check
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Compile add-on
+        run: python -m compileall "${{ matrix.addon }}"
+
+      - name: Read version from bl_info
+        id: meta
+        shell: bash
+        run: |
+          version=$(grep -m1 '"version"' "${{ matrix.addon }}/__init__.py" \
+            | sed -E 's/.*\(([0-9]+), *([0-9]+), *([0-9]+)\).*/\1.\2.\3/')
+          if [ -z "$version" ]; then
+            echo "Could not read version from ${{ matrix.addon }}/__init__.py" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Zip add-on
+        shell: bash
+        run: |
+          zip -r "${{ matrix.addon }}-${{ steps.meta.outputs.version }}.zip" \
+            "${{ matrix.addon }}" \
+            -x '*/__pycache__/*' '*.pyc'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.addon }}-${{ steps.meta.outputs.version }}
+          path: ${{ matrix.addon }}-${{ steps.meta.outputs.version }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged add-ons
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pes_*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

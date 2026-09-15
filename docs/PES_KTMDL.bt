@@ -1,0 +1,1308 @@
+// PES 2008-2013 / PES 2013 KTMDL Binary Template
+// Standalone KTMDL parser for 010 Editor.
+//
+// This template parses KTMDL ONLY. The opened file must start with "KTMDL".
+//
+// Reverse-engineered from the supplied PES 2013 samples:
+//   - face
+//   - hair
+//   - big-endian ball
+//   - player body / uniform A, B and C variants
+//   - reduced Uni_C body model
+//   - Champions League cup
+//   - Champions League cup ribbon
+//
+// Structure names were then cross-checked against the PES 2008 IDA type dump.
+// Where that dump contains the real Konami type/field names, this template uses
+// those names directly.
+//
+// ---------------------------------------------------------------------------
+// CONFIRMED / VERY STRONG
+// ---------------------------------------------------------------------------
+//
+// Header:
+//   * ktModelDataHeader is a fixed 0xC0-byte structure.
+//   * majorVersion/minorVersion are 2/2 in every supplied sample.
+//   * endian[2] is:
+//         01 00 = little-endian
+//         00 01 = big-endian
+//   * configNo is 0 in every supplied sample.
+//   * system_reserve[10] is zero in every supplied sample.
+//
+// Core on-disk structures named by Konami's IDA types:
+//   * ktModelDataHeader
+//   * ktModelDataBone
+//   * ktModelDataPacket
+//   * ktModelDataStreamInfo
+//   * ktModelDataVertexElement
+//   * ktModelDataGroup
+//   * ktModelDataBounding
+//   * ktModelDataLocator
+//   * ktModelDataMaterial
+//   * ktModelDataTextureType
+//   * ktModelDataDebugInfo
+//   * ktModelDataExtraHead
+//
+// Packet / primitive handling:
+//   * ktModelDataPacket.primType uses ktPrimitiveType:
+//         0 TRIANGLESTRIP
+//         1 TRIANGLELIST
+//         2 TRIANGLEFAN
+//         3 LINELIST
+//         4 LINESTRIP
+//         5 POINT
+//         6 QUADLIST
+//         7 QUADSTRIP
+//         8 RECTLIST
+//   * All currently supplied KTMDLs use TRIANGLESTRIP, but the format supports
+//     the other primitive types above.
+//   * Packet texture refs are exactly:
+//         uint16 id
+//         uint8  texParam
+//         uint8  uvNo
+//   * uvNo selects the vertex TEXCOORD channel.
+//   * texParam has observed values 0, 1 and 2; exact enum names are still unknown.
+//   * packet offset[3] and r are the real Konami field names.
+//
+// Streams:
+//   * ktModelDataStreamInfo is used for both vertex and index data.
+//   * In every supplied sample:
+//         type 0 = vertex stream
+//         type 1 = index stream
+//   * Vertex streamOffset is relative to the ktModelDataStreamInfo record.
+//   * elementOffset is relative to the same record.
+//   * All supplied index streams contain uint16 indices.
+//   * Geometry is declaration-driven. Never infer a layout from stride alone.
+//
+// Skinning:
+//   * vertex BLENDINDICES -> packet skeleton table -> ktModelDataBone index.
+//   * Packet skeletonOffset is signed and packet-relative.
+//   * BLENDWEIGHT stores N explicit weights and one implicit remainder:
+//         FLOAT1: w1 = 1 - w0
+//         FLOAT2: w2 = 1 - w0 - w1
+//         FLOAT3: w3 = 1 - w0 - w1 - w2
+//
+// Bones:
+//   * ktModelDataBone contains matrix and invertMatrix.
+//   * The matrix pairs are numerical inverses in the supplied files.
+//   * parentNo is the bone hierarchy parent; -1 means root.
+//
+// Materials / textures:
+//   * ktModelDataMaterial is 0xA0 bytes.
+//   * shaderId resolves to the shader-name table in debug info.
+//   * ktModelDataTextureType is 0x50 bytes and exposes:
+//         addrU, addrV, filterMag, filterMin, filterMip, mode,
+//         textureIndex, param[4][4]
+//   * Empirically in these PES samples, texture mode correlates with:
+//         0 color/diffuse
+//         1 normal
+//         2 specular
+//         3 occlusion
+//         4 reflection
+//     These descriptive names are empirical; the IDA field itself is named "mode".
+//   * textureIndex indexes the ktTextureId / texture filename list.
+//
+// Debug strings:
+//   * ktModelDataDebugInfo is:
+//         flag, textureNameOffset, shaderNameOffset
+//   * The supplied binaries consistently place two additional uint32 fields
+//     immediately after it:
+//         shaderNameCount
+//         shaderIdOffset
+//   * shaderIdOffset points to the exact distinct material shaderId list.
+//   * textureNameOffset and shaderNameOffset point to arrays of relative string
+//     offsets; each string offset is relative to its own offset-array base.
+//
+// Groups / bounds:
+//   * ktModelDataGroup and ktModelDataBounding contain exact AABBs.
+//   * packet.groupNo indexes the group table.
+//   * Group parent is a group index; -1 is root.
+//
+// Extras:
+//   * extraCount=1 samples contain a ktModelDataExtraHead at extraOffset.
+//   * Current PC samples use:
+//         type      = 1
+//         localId   = 0x1001
+//         flag      = 1
+//         chunkSize = 0x20
+//     The remaining payload bytes are intentionally left raw.
+//   * Models with extraCount=0 begin bones directly at 0xC0.
+//
+// Vertex semantics observed:
+//   0x10 POSITION
+//   0x12 NORMAL
+//   0x16 TEXCOORD0
+//   0x17 TEXCOORD1
+//   0x18 TEXCOORD2
+//   0x19 TEXCOORD3
+//   0x1E TANGENT
+//   0x1F BINORMAL
+//   0x20 BLENDWEIGHT
+//   0x21 BLENDINDICES
+//
+// Vertex formats observed:
+//   0x00 FLOAT1
+//   0x01 FLOAT2
+//   0x02 FLOAT3
+//   0x0B UBYTE4
+//
+// 18 distinct declaration signatures are currently known.
+// Unknown/future declarations fall back to raw vertex bytes.
+//
+// Morph-related header fields are retained because they are part of the real
+// ktModelDataHeader layout, but this template deliberately does not attempt to
+// decode morph data.
+//
+// ---------------------------------------------------------------------------
+
+#define PARSE_TYPED_VERTEX_BUFFERS 1
+#define PARSE_INDEX_BUFFERS        1
+#define PARSE_NAME_STRINGS         1
+
+// Vertex semantics
+#define KT_SEM_POSITION      0x10
+#define KT_SEM_NORMAL        0x12
+#define KT_SEM_TEXCOORD0     0x16
+#define KT_SEM_TEXCOORD1     0x17
+#define KT_SEM_TEXCOORD2     0x18
+#define KT_SEM_TEXCOORD3     0x19
+#define KT_SEM_TANGENT       0x1E
+#define KT_SEM_BINORMAL      0x1F
+#define KT_SEM_BLENDWEIGHT   0x20
+#define KT_SEM_BLENDINDICES  0x21
+
+// Vertex element types
+#define KT_TYPE_FLOAT1       0x00
+#define KT_TYPE_FLOAT2       0x01
+#define KT_TYPE_FLOAT3       0x02
+#define KT_TYPE_UBYTE4       0x0B
+
+// ktModelDataTextureType.mode values observed in the supplied models.
+// Konami's field name is "mode"; descriptive labels below are empirical.
+#define KT_TEXMODE_COLOR_OR_DIFFUSE  0
+#define KT_TEXMODE_NORMAL            1
+#define KT_TEXMODE_SPECULAR          2
+#define KT_TEXMODE_OCCLUSION         3
+#define KT_TEXMODE_REFLECTION        4
+
+// ktPrimitiveType
+#define KT_TRIANGLESTRIP  0
+#define KT_TRIANGLELIST   1
+#define KT_TRIANGLEFAN    2
+#define KT_LINELIST       3
+#define KT_LINESTRIP      4
+#define KT_POINT          5
+#define KT_QUADLIST       6
+#define KT_QUADSTRIP      7
+#define KT_RECTLIST       8
+
+// ktModelDataStreamInfo.type values confirmed by every supplied sample.
+#define KT_STREAM_VERTEX  0
+#define KT_STREAM_INDEX   1
+
+// Internal vertex layout IDs
+#define KT_LAYOUT_UNKNOWN             0
+#define KT_LAYOUT_32_STATIC           1
+#define KT_LAYOUT_36_RIGID            2
+#define KT_LAYOUT_40_SKIN1            3
+#define KT_LAYOUT_44_SKIN2            4
+#define KT_LAYOUT_44_RIGID_UV2        5
+#define KT_LAYOUT_48_SKIN1_UV2        6
+#define KT_LAYOUT_48_SKIN3            7
+#define KT_LAYOUT_56_STATIC_TBN       8
+#define KT_LAYOUT_60_RIGID_TBN        9
+#define KT_LAYOUT_64_SKIN1_TBN       10
+#define KT_LAYOUT_64_STATIC_TBN_UV2  11
+#define KT_LAYOUT_68_SKIN2_TBN       12
+#define KT_LAYOUT_72_SKIN1_TBN_UV2   13
+#define KT_LAYOUT_72_SKIN3_TBN       14
+#define KT_LAYOUT_76_SKIN2_TBN_UV2   15
+#define KT_LAYOUT_80_SKIN3_TBN_UV2   16
+#define KT_LAYOUT_88_SKIN3_TBN_UV3   17
+#define KT_LAYOUT_96_SKIN3_TBN_UV4   18
+
+int IsKTMDL( int64 p )
+{
+    return ReadUByte(p + 0) == 0x4B &&
+           ReadUByte(p + 1) == 0x54 &&
+           ReadUByte(p + 2) == 0x4D &&
+           ReadUByte(p + 3) == 0x44 &&
+           ReadUByte(p + 4) == 0x4C &&
+           ReadUByte(p + 5) == 0x00 &&
+           ReadUByte(p + 6) == 0x00 &&
+           ReadUByte(p + 7) == 0x00;
+}
+
+uint ReadUInt32LEAt( int64 p )
+{
+    return ((uint)ReadUByte(p + 0)      ) |
+           ((uint)ReadUByte(p + 1) <<  8) |
+           ((uint)ReadUByte(p + 2) << 16) |
+           ((uint)ReadUByte(p + 3) << 24);
+}
+
+uint ReadUInt32BEAt( int64 p )
+{
+    return ((uint)ReadUByte(p + 3)      ) |
+           ((uint)ReadUByte(p + 2) <<  8) |
+           ((uint)ReadUByte(p + 1) << 16) |
+           ((uint)ReadUByte(p + 0) << 24);
+}
+
+int CStringSizeAt( int64 p )
+{
+    local int64 q = p;
+    while (q < FileSize() && ReadUByte(q) != 0)
+        q++;
+
+    if (q < FileSize())
+        q++;
+
+    return (int)(q - p);
+}
+
+int ElemIs( int64 declPos, int index, int offset, int type, int semantic )
+{
+    local int64 p = declPos + index * 4;
+
+    return ReadUByte(p + 1) == offset &&
+           ReadUByte(p + 2) == type &&
+           ReadUByte(p + 3) == semantic;
+}
+
+// Declaration signatures observed in the supplied samples.
+// We intentionally check exact declarations so equal strides with different
+// meanings (44, 48 and 64 bytes in particular) cannot be confused.
+int DetectVertexLayout( int64 d, int count, int stride )
+{
+    // 32: POSITION, NORMAL, UV0
+    if (stride == 32 && count == 3 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,2,0x18,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_32_STATIC;
+
+    // 36: POSITION, BLENDINDICES, NORMAL, UV0
+    if (stride == 36 && count == 4 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,2,0x10,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_36_RIGID;
+
+    // 40: POSITION, FLOAT1 WEIGHT, INDICES, NORMAL, UV0
+    if (stride == 40 && count == 5 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT1,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x10,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x14,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x20,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_40_SKIN1;
+
+    // 44 body: POSITION, FLOAT2 WEIGHT, INDICES, NORMAL, UV0
+    if (stride == 44 && count == 5 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT2,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x14,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x18,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x24,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_44_SKIN2;
+
+    // 44 ribbon rigid: POSITION, INDICES, NORMAL, UV0, UV1
+    if (stride == 44 && count == 5 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,2,0x10,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,4,0x24,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1))
+        return KT_LAYOUT_44_RIGID_UV2;
+
+    // 48 ribbon: POSITION, FLOAT1 WEIGHT, INDICES, NORMAL, UV0, UV1
+    if (stride == 48 && count == 6 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT1,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x10,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x14,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x20,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,5,0x28,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1))
+        return KT_LAYOUT_48_SKIN1_UV2;
+
+    // 48 body: POSITION, FLOAT3 WEIGHT, INDICES, NORMAL, UV0
+    if (stride == 48 && count == 5 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x18,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x28,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_48_SKIN3;
+
+    // 56 cup static: POSITION, NORMAL, TANGENT, BINORMAL, UV0
+    if (stride == 56 && count == 5 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,2,0x18,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,3,0x24,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,4,0x30,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_56_STATIC_TBN;
+
+    // 60 rigid: POSITION, INDICES, NORMAL, TANGENT, BINORMAL, UV0
+    if (stride == 60 && count == 6 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,2,0x10,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,4,0x28,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,5,0x34,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_60_RIGID_TBN;
+
+    // 64 skinned: FLOAT1 weight + TBN + UV0
+    if (stride == 64 && count == 7 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT1,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x10,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x14,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x20,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x2C,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x38,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_64_SKIN1_TBN;
+
+    // 64 static ball: POSITION, TBN, UV0, UV1
+    if (stride == 64 && count == 6 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,2,0x18,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,3,0x24,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,4,0x30,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,5,0x38,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1))
+        return KT_LAYOUT_64_STATIC_TBN_UV2;
+
+    // 68: FLOAT2 weight + TBN + UV0
+    if (stride == 68 && count == 7 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT2,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x14,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x18,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x24,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x30,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x3C,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_68_SKIN2_TBN;
+
+    // 72 A: FLOAT1 weight + TBN + UV0/UV1
+    if (stride == 72 && count == 8 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT1,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x10,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x14,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x20,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x2C,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x38,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,7,0x40,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1))
+        return KT_LAYOUT_72_SKIN1_TBN_UV2;
+
+    // 72 B: FLOAT3 weight + TBN + UV0
+    if (stride == 72 && count == 7 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x18,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x28,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x34,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x40,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0))
+        return KT_LAYOUT_72_SKIN3_TBN;
+
+    // 76: FLOAT2 weight + TBN + UV0/UV1
+    if (stride == 76 && count == 8 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT2,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x14,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x18,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x24,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x30,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x3C,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,7,0x44,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1))
+        return KT_LAYOUT_76_SKIN2_TBN_UV2;
+
+    // 80: FLOAT3 weight + TBN + UV0/UV1
+    if (stride == 80 && count == 8 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x18,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x28,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x34,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x40,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,7,0x48,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1))
+        return KT_LAYOUT_80_SKIN3_TBN_UV2;
+
+    // 88: FLOAT3 weight + TBN + UV0/UV1/UV2
+    if (stride == 88 && count == 9 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x18,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x28,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x34,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x40,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,7,0x48,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1) &&
+        ElemIs(d,8,0x50,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD2))
+        return KT_LAYOUT_88_SKIN3_TBN_UV3;
+
+    // 96: FLOAT3 weight + TBN + UV0/UV1/UV2/UV3
+    if (stride == 96 && count == 10 &&
+        ElemIs(d,0,0x00,KT_TYPE_FLOAT3,KT_SEM_POSITION) &&
+        ElemIs(d,1,0x0C,KT_TYPE_FLOAT3,KT_SEM_BLENDWEIGHT) &&
+        ElemIs(d,2,0x18,KT_TYPE_UBYTE4,KT_SEM_BLENDINDICES) &&
+        ElemIs(d,3,0x1C,KT_TYPE_FLOAT3,KT_SEM_NORMAL) &&
+        ElemIs(d,4,0x28,KT_TYPE_FLOAT3,KT_SEM_TANGENT) &&
+        ElemIs(d,5,0x34,KT_TYPE_FLOAT3,KT_SEM_BINORMAL) &&
+        ElemIs(d,6,0x40,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD0) &&
+        ElemIs(d,7,0x48,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD1) &&
+        ElemIs(d,8,0x50,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD2) &&
+        ElemIs(d,9,0x58,KT_TYPE_FLOAT2,KT_SEM_TEXCOORD3))
+        return KT_LAYOUT_96_SKIN3_TBN_UV4;
+
+    return KT_LAYOUT_UNKNOWN;
+}
+
+// ---------------------------------------------------------------------------
+// Core KTMDL structures
+// Names below match the PES 2008 IDA type dump where available.
+// ---------------------------------------------------------------------------
+
+typedef struct
+{
+    char id[8];                         // +0x00 "KTMDL\0\0\0"
+
+    uint majorVersion;                  // +0x08
+    uint minorVersion;                  // +0x0C
+
+    ubyte endian[2];                    // +0x10: 01 00 LE, 00 01 BE
+    ubyte configNo;                     // +0x12
+    ubyte pad;                          // +0x13
+
+    uint flag;                          // +0x14
+
+    uint boneCount;                     // +0x18
+    int  boneOffset;                    // +0x1C
+
+    uint skeletonIndicesCount;          // +0x20
+    int  skeletonIndicesOffset;         // +0x24
+
+    uint packetCount;                   // +0x28
+    int  packetOffset;                  // +0x2C
+
+    uint streamInfoCount;               // +0x30
+    int  streamInfoOffset;              // +0x34
+
+    uint locatorCount;                  // +0x38
+    int  locatorOffset;                 // +0x3C
+
+    uint groupCount;                    // +0x40
+    int  groupOffset;                   // +0x44
+
+    uint materialCount;                 // +0x48
+    int  materialOffset;                // +0x4C
+
+    uint textureTypeCount;              // +0x50
+    int  textureTypeOffset;             // +0x54
+
+    uint boundingCount;                 // +0x58
+    int  boundingOffset;                // +0x5C
+
+    int debugInfoOffset;                // +0x60
+    int extraOffset;                    // +0x64
+
+    uint morphNameIdCount;              // +0x68
+    int  morphNameIdOffset;             // +0x6C
+    int  morphIndexOffset;              // +0x70
+
+    uint streamDataSize;                // +0x74
+    int  streamDataOffset;              // +0x78
+
+    uint textureNameIdCount;            // +0x7C
+    int  textureNameIdOffset;           // +0x80
+
+    uint morphIndexCount;               // +0x84
+
+    uint vertexElementCount;            // +0x88
+    int  vertexElementOffset;           // +0x8C
+
+    uint size;                          // +0x90
+    uint extraCount;                    // +0x94
+
+    uint system_reserve[10];            // +0x98
+} ktModelDataHeader;                    // 0xC0
+
+typedef struct
+{
+    uint type;
+    ushort localId;
+    ushort flag;
+    uint chunkSize;                     // includes this 0x10-byte head
+    uint reserved;
+} ktModelDataExtraHead;                 // 0x10
+
+typedef struct
+{
+    uint64 nameId;
+    uint64 pad0;
+
+    float matrix[4][4];
+    float invertMatrix[4][4];
+
+    float bound_max[3];
+    uint pad1;
+
+    float bound_min[3];
+    int parentNo;
+} ktModelDataBone;                      // 0xB0
+
+typedef struct
+{
+    ushort id;                          // index into texture-type table
+    ubyte texParam;                     // observed 0/1/2
+    ubyte uvNo;                         // vertex TEXCOORD channel
+} ktModelDataPacketTextureRef;          // 4 bytes
+
+typedef struct
+{
+    ushort flag;                        // exact bit meanings still unknown
+    ubyte primType;                     // ktPrimitiveType
+    ubyte pad;
+
+    uint materialNo;
+    uint groupNo;
+    uint blockNo;
+
+    uint streamInfoCount;
+    int  streamInfoOffset;              // packet-relative
+
+    uint skeletonCount;
+    int  skeletonOffset;                // packet-relative
+
+    uint indexCount;                    // number of index stream-info records
+    int  indexInfoOffset;               // packet-relative
+
+    int extraOffset;                    // packet-relative; zero in supplied samples
+
+    ubyte nTexture;
+    ubyte pad4[3];
+
+    ktModelDataPacketTextureRef tex[8];
+
+    float offset[3];
+    float r;
+} ktModelDataPacket;                    // 0x60
+
+typedef struct
+{
+    int  streamOffset;                  // relative to this stream-info record
+    uint numVertex;                     // vertices, or indices for type=INDEX
+
+    ubyte numTarget;
+    ubyte stride;
+    ubyte elementCount;
+    ubyte numShaderTarget;
+
+    int elementOffset;                  // relative to this stream-info record
+    int targetIndexOffset;
+    int type;                           // observed 0 vertex, 1 index
+
+    int pad[2];
+} ktModelDataStreamInfo;                // 0x20
+
+typedef struct
+{
+    ubyte stream;
+    ubyte offset;
+    ubyte format;
+    ubyte semantics;
+} ktModelDataVertexElement;             // 4 bytes
+
+typedef struct
+{
+    uint64 nameId;
+    uint flag;
+    int parent;
+
+    float bound_max[3];
+    uint pad1;
+
+    float bound_min[3];
+    uint pad2;
+} ktModelDataGroup;                     // 0x30
+
+typedef struct
+{
+    uint64 nameId;
+    uint nBlock;
+    uint offset;
+
+    float bound_max[3];
+    uint pad1;
+
+    float bound_min[3];
+    uint pad2;
+} ktModelDataBounding;                  // 0x30
+
+typedef struct
+{
+    uint64 nameId;
+    int parentNo;
+    uint pad;
+
+    float matrix[4][4];
+} ktModelDataLocator;                   // 0x50
+
+typedef struct
+{
+    uint64 nameId;
+    uint64 pad;
+
+    uint nParam;
+    uint shaderId;
+
+    uint pad2[2];
+
+    float param[8][4];
+} ktModelDataMaterial;                  // 0xA0
+
+typedef struct
+{
+    uint64 nameId;
+
+    ubyte addrU;
+    ubyte addrV;
+    ubyte filterMag;
+    ubyte filterMin;
+    ubyte filterMip;
+    ubyte mode;
+
+    ushort textureIndex;
+
+    float param[4][4];
+} ktModelDataTextureType;               // 0x50
+
+typedef struct
+{
+    uint64 hi;
+    uint64 lo;
+} ktTextureId;                          // 0x10
+
+typedef struct
+{
+    uint flag;
+    int textureNameOffset;              // debug-info-base relative
+    int shaderNameOffset;               // debug-info-base relative
+} ktModelDataDebugInfo;                 // 0x0C
+
+// This pair is not named in the IDA type dump, but is binary-confirmed in every
+// supplied KTMDL immediately after ktModelDataDebugInfo.
+typedef struct
+{
+    uint shaderNameCount;
+    int shaderIdOffset;                 // debug-info-base relative
+} ktModelDataDebugNameExtension;        // 0x08
+
+typedef struct
+{
+    char text[CStringSizeAt(FTell())];
+} KTCString;
+
+// ---------------------------------------------------------------------------
+// 18 observed typed vertex layouts
+// ---------------------------------------------------------------------------
+
+// 32: cup static
+typedef struct {
+    float position[3];
+    float normal[3];
+    float uv0[2];
+} KTVertex32Static;
+
+// 36: rigid skinning index + normal + UV0
+typedef struct {
+    float position[3];
+    ubyte boneIndices[4];
+    float normal[3];
+    float uv0[2];
+} KTVertex36Rigid;
+
+// 40: one explicit weight
+typedef struct {
+    float position[3];
+    float weights[1];                   // implicit w1
+    ubyte boneIndices[4];
+    float normal[3];
+    float uv0[2];
+} KTVertex40Skin1;
+
+// 44 body: two explicit weights
+typedef struct {
+    float position[3];
+    float weights[2];                   // implicit w2
+    ubyte boneIndices[4];
+    float normal[3];
+    float uv0[2];
+} KTVertex44Skin2;
+
+// 44 ribbon rigid: two UV sets
+typedef struct {
+    float position[3];
+    ubyte boneIndices[4];
+    float normal[3];
+    float uv0[2];
+    float uv1[2];
+} KTVertex44RigidUV2;
+
+// 48 ribbon: one weight + two UV sets
+typedef struct {
+    float position[3];
+    float weights[1];                   // implicit w1
+    ubyte boneIndices[4];
+    float normal[3];
+    float uv0[2];
+    float uv1[2];
+} KTVertex48Skin1UV2;
+
+// 48 body: three explicit weights
+typedef struct {
+    float position[3];
+    float weights[3];                   // implicit w3
+    ubyte boneIndices[4];
+    float normal[3];
+    float uv0[2];
+} KTVertex48Skin3;
+
+// 56 cup static TBN
+typedef struct {
+    float position[3];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+} KTVertex56StaticTBN;
+
+// 60 rigid TBN
+typedef struct {
+    float position[3];
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+} KTVertex60RigidTBN;
+
+// 64 skinned hair/body
+typedef struct {
+    float position[3];
+    float weights[1];                   // implicit w1
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+} KTVertex64Skin1TBN;
+
+// 64 static ball
+typedef struct {
+    float position[3];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+    float uv1[2];
+} KTVertex64StaticTBNUV2;
+
+// 68 body
+typedef struct {
+    float position[3];
+    float weights[2];                   // implicit w2
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+} KTVertex68Skin2TBN;
+
+// 72 layout A
+typedef struct {
+    float position[3];
+    float weights[1];                   // implicit w1
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+    float uv1[2];
+} KTVertex72Skin1TBNUV2;
+
+// 72 layout B
+typedef struct {
+    float position[3];
+    float weights[3];                   // implicit w3
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+} KTVertex72Skin3TBN;
+
+// 76
+typedef struct {
+    float position[3];
+    float weights[2];                   // implicit w2
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+    float uv1[2];
+} KTVertex76Skin2TBNUV2;
+
+// 80
+typedef struct {
+    float position[3];
+    float weights[3];                   // implicit w3
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+    float uv1[2];
+} KTVertex80Skin3TBNUV2;
+
+// 88 face
+typedef struct {
+    float position[3];
+    float weights[3];                   // implicit w3
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+    float uv1[2];
+    float uv2[2];
+} KTVertex88Skin3TBNUV3;
+
+// 96 uniform shirt
+typedef struct {
+    float position[3];
+    float weights[3];                   // implicit w3
+    ubyte boneIndices[4];
+    float normal[3];
+    float tangent[3];
+    float binormal[3];
+    float uv0[2];
+    float uv1[2];
+    float uv2[2];
+    float uv3[2];
+} KTVertex96Skin3TBNUV4;
+
+// Globals used while expanding one linked vertex buffer.
+local uint  gVertexCount;
+local ubyte gVertexStride;
+local int   gVertexLayout;
+
+typedef struct
+{
+#if PARSE_TYPED_VERTEX_BUFFERS
+    if (gVertexLayout == KT_LAYOUT_32_STATIC)
+        KTVertex32Static vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_36_RIGID)
+        KTVertex36Rigid vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_40_SKIN1)
+        KTVertex40Skin1 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_44_SKIN2)
+        KTVertex44Skin2 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_44_RIGID_UV2)
+        KTVertex44RigidUV2 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_48_SKIN1_UV2)
+        KTVertex48Skin1UV2 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_48_SKIN3)
+        KTVertex48Skin3 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_56_STATIC_TBN)
+        KTVertex56StaticTBN vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_60_RIGID_TBN)
+        KTVertex60RigidTBN vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_64_SKIN1_TBN)
+        KTVertex64Skin1TBN vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_64_STATIC_TBN_UV2)
+        KTVertex64StaticTBNUV2 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_68_SKIN2_TBN)
+        KTVertex68Skin2TBN vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_72_SKIN1_TBN_UV2)
+        KTVertex72Skin1TBNUV2 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_72_SKIN3_TBN)
+        KTVertex72Skin3TBN vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_76_SKIN2_TBN_UV2)
+        KTVertex76Skin2TBNUV2 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_80_SKIN3_TBN_UV2)
+        KTVertex80Skin3TBNUV2 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_88_SKIN3_TBN_UV3)
+        KTVertex88Skin3TBNUV3 vertices[gVertexCount];
+    else if (gVertexLayout == KT_LAYOUT_96_SKIN3_TBN_UV4)
+        KTVertex96Skin3TBNUV4 vertices[gVertexCount];
+    else
+        ubyte raw[gVertexCount * gVertexStride];
+#else
+    ubyte raw[gVertexCount * gVertexStride];
+#endif
+} KTVertexBufferView;
+
+// ---------------------------------------------------------------------------
+// Endian detection for a STANDALONE KTMDL
+// ---------------------------------------------------------------------------
+
+if (!IsKTMDL(0))
+{
+    Warning("This template expects a standalone KTMDL starting at file offset 0.");
+    return;
+}
+
+// The IDA structure names this as endian[2]. All supplied files use a direct
+// byte-order marker:
+//     01 00 = little-endian
+//     00 01 = big-endian
+if (ReadUByte(0x10) == 0x01 && ReadUByte(0x11) == 0x00)
+{
+    LittleEndian();
+}
+else if (ReadUByte(0x10) == 0x00 && ReadUByte(0x11) == 0x01)
+{
+    BigEndian();
+}
+else
+{
+    // Fallback for an unknown variant.
+    local uint leSize = ReadUInt32LEAt(0x90);
+    local uint beSize = ReadUInt32BEAt(0x90);
+
+    if (beSize == FileSize() && leSize != FileSize())
+        BigEndian();
+    else
+        LittleEndian();
+}
+
+// ---------------------------------------------------------------------------
+// KTMDL
+// ---------------------------------------------------------------------------
+
+local int64 ktBase = 0;
+local int i;
+local int j;
+
+FSeek(ktBase);
+ktModelDataHeader header;
+
+if (header.size > FileSize())
+    Warning("ktModelDataHeader.size is larger than the opened file.");
+
+if (header.majorVersion != 2 || header.minorVersion != 2)
+    Warning("This KTMDL is not the 2.2 variant used by all supplied samples.");
+
+// ---------------------------------------------------------------------------
+// Optional model extras.
+// ---------------------------------------------------------------------------
+
+if (header.extraCount > 0 &&
+    header.extraOffset >= 0 &&
+    header.extraOffset < header.size)
+{
+    FSeek(ktBase + header.extraOffset);
+
+    for (i = 0; i < header.extraCount; i++)
+    {
+        local int64 extraStart = FTell();
+
+        ktModelDataExtraHead extraHead;
+
+        if (extraHead.chunkSize < 0x10)
+        {
+            Warning("Invalid ktModelDataExtraHead.chunkSize.");
+            break;
+        }
+
+        if (extraHead.chunkSize > 0x10)
+            ubyte extraPayload[extraHead.chunkSize - 0x10];
+
+        FSeek(extraStart + extraHead.chunkSize);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bones.
+// ---------------------------------------------------------------------------
+
+if (header.boneCount > 0)
+{
+    FSeek(ktBase + header.boneOffset);
+    ktModelDataBone bones[header.boneCount];
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton-indices storage region.
+//
+// The header count is the number of skeleton-index sets, not the number of
+// uint16 entries. Exact per-packet lists are decoded again below using each
+// packet's skeletonCount/skeletonOffset.
+// ---------------------------------------------------------------------------
+
+if (header.packetOffset > header.skeletonIndicesOffset)
+{
+    FSeek(ktBase + header.skeletonIndicesOffset);
+    ubyte skeletonIndicesRegion[
+        header.packetOffset - header.skeletonIndicesOffset
+    ];
+}
+
+// ---------------------------------------------------------------------------
+// Packets.
+// ---------------------------------------------------------------------------
+
+if (header.packetCount > 0)
+{
+    FSeek(ktBase + header.packetOffset);
+    ktModelDataPacket packets[header.packetCount];
+}
+
+// ---------------------------------------------------------------------------
+// Global stream-info table.
+// ---------------------------------------------------------------------------
+
+if (header.streamInfoCount > 0)
+{
+    FSeek(ktBase + header.streamInfoOffset);
+    ktModelDataStreamInfo streamInfos[header.streamInfoCount];
+}
+
+// ---------------------------------------------------------------------------
+// Global vertex-element table.
+// ---------------------------------------------------------------------------
+
+if (header.vertexElementCount > 0)
+{
+    FSeek(ktBase + header.vertexElementOffset);
+    ktModelDataVertexElement vertexElements[header.vertexElementCount];
+}
+
+// ---------------------------------------------------------------------------
+// Locators.
+// ---------------------------------------------------------------------------
+
+if (header.locatorCount > 0)
+{
+    FSeek(ktBase + header.locatorOffset);
+    ktModelDataLocator locators[header.locatorCount];
+}
+
+// ---------------------------------------------------------------------------
+// Groups.
+// ---------------------------------------------------------------------------
+
+if (header.groupCount > 0)
+{
+    FSeek(ktBase + header.groupOffset);
+    ktModelDataGroup groups[header.groupCount];
+}
+
+// ---------------------------------------------------------------------------
+// Bounding records.
+// ---------------------------------------------------------------------------
+
+if (header.boundingCount > 0)
+{
+    FSeek(ktBase + header.boundingOffset);
+    ktModelDataBounding bounding[header.boundingCount];
+}
+
+// ---------------------------------------------------------------------------
+// Materials.
+// ---------------------------------------------------------------------------
+
+if (header.materialCount > 0)
+{
+    FSeek(ktBase + header.materialOffset);
+    ktModelDataMaterial materials[header.materialCount];
+}
+
+// ---------------------------------------------------------------------------
+// Texture IDs / names.
+// ---------------------------------------------------------------------------
+
+if (header.textureNameIdCount > 0)
+{
+    FSeek(ktBase + header.textureNameIdOffset);
+    ktTextureId textureNameIds[header.textureNameIdCount];
+}
+
+// ---------------------------------------------------------------------------
+// Texture types / samplers.
+// ---------------------------------------------------------------------------
+
+if (header.textureTypeCount > 0)
+{
+    FSeek(ktBase + header.textureTypeOffset);
+    ktModelDataTextureType textureTypes[header.textureTypeCount];
+}
+
+// ---------------------------------------------------------------------------
+// Debug info + human-readable texture/shader names.
+// ---------------------------------------------------------------------------
+
+if (header.debugInfoOffset > 0 &&
+    header.debugInfoOffset < header.size)
+{
+    FSeek(ktBase + header.debugInfoOffset);
+
+    local int64 debugBase = FTell();
+
+    ktModelDataDebugInfo debugInfo;
+    ktModelDataDebugNameExtension debugNames;
+
+    // Texture filenames.
+    if (header.textureNameIdCount > 0 &&
+        debugInfo.textureNameOffset > 0)
+    {
+        FSeek(debugBase + debugInfo.textureNameOffset);
+        local int64 textureNameOffsetBase = FTell();
+
+        uint textureNameOffsets[header.textureNameIdCount];
+
+#if PARSE_NAME_STRINGS
+        for (i = 0; i < header.textureNameIdCount; i++)
+        {
+            FSeek(textureNameOffsetBase + textureNameOffsets[i]);
+            KTCString textureName;
+        }
+#endif
+    }
+
+    // Shader IDs used by materials.
+    if (debugNames.shaderNameCount > 0 &&
+        debugNames.shaderIdOffset > 0)
+    {
+        FSeek(debugBase + debugNames.shaderIdOffset);
+        uint shaderIds[debugNames.shaderNameCount];
+    }
+
+    // Human-readable shader names. Offsets are relative to this offset table.
+    if (debugNames.shaderNameCount > 0 &&
+        debugInfo.shaderNameOffset > 0)
+    {
+        FSeek(debugBase + debugInfo.shaderNameOffset);
+        local int64 shaderNameOffsetBase = FTell();
+
+        uint shaderNameOffsets[debugNames.shaderNameCount];
+
+#if PARSE_NAME_STRINGS
+        for (i = 0; i < debugNames.shaderNameCount; i++)
+        {
+            FSeek(shaderNameOffsetBase + shaderNameOffsets[i]);
+            KTCString shaderName;
+        }
+#endif
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-packet linked views.
+//
+// For every packet this expands:
+//   * the exact skeleton-index list
+//   * vertex stream-info record(s)
+//   * declaration of the first vertex stream
+//   * typed/raw first vertex buffer
+//   * index stream-info record(s)
+//   * first uint16 index buffer
+//
+// All supplied files use one vertex stream and one index stream per packet,
+// but the file structure allows counts > 1.
+// ---------------------------------------------------------------------------
+
+for (i = 0; i < header.packetCount; i++)
+{
+    local int64 packetPos =
+        ktBase + header.packetOffset + (i * 0x60);
+
+    // Packet skeleton table.
+    if (packets[i].skeletonCount > 0)
+    {
+        FSeek(packetPos + packets[i].skeletonOffset);
+        ushort packetSkeletonIndices[packets[i].skeletonCount];
+    }
+
+    // Vertex stream-info record(s).
+    if (packets[i].streamInfoCount > 0)
+    {
+        FSeek(packetPos + packets[i].streamInfoOffset);
+
+        local int64 firstVertexStreamInfoPos = FTell();
+
+        ktModelDataStreamInfo packetVertexStreamInfos[
+            packets[i].streamInfoCount
+        ];
+
+        // Expand the first stream, matching all supplied samples.
+        if (packetVertexStreamInfos[0].type == KT_STREAM_VERTEX)
+        {
+            local int64 declPos =
+                firstVertexStreamInfoPos +
+                packetVertexStreamInfos[0].elementOffset;
+
+            if (packetVertexStreamInfos[0].elementCount > 0)
+            {
+                FSeek(declPos);
+                ktModelDataVertexElement packetVertexElements[
+                    packetVertexStreamInfos[0].elementCount
+                ];
+            }
+
+            gVertexCount  = packetVertexStreamInfos[0].numVertex;
+            gVertexStride = packetVertexStreamInfos[0].stride;
+            gVertexLayout = DetectVertexLayout(
+                declPos,
+                packetVertexStreamInfos[0].elementCount,
+                packetVertexStreamInfos[0].stride
+            );
+
+            if (gVertexCount > 0 && gVertexStride > 0)
+            {
+                FSeek(
+                    firstVertexStreamInfoPos +
+                    packetVertexStreamInfos[0].streamOffset
+                );
+
+                KTVertexBufferView packetVertexBuffer;
+            }
+        }
+    }
+
+    // Index stream-info record(s).
+    if (packets[i].indexCount > 0)
+    {
+        FSeek(packetPos + packets[i].indexInfoOffset);
+
+        local int64 firstIndexStreamInfoPos = FTell();
+
+        ktModelDataStreamInfo packetIndexStreamInfos[
+            packets[i].indexCount
+        ];
+
+#if PARSE_INDEX_BUFFERS
+        if (packetIndexStreamInfos[0].type == KT_STREAM_INDEX &&
+            packetIndexStreamInfos[0].numVertex > 0)
+        {
+            FSeek(
+                firstIndexStreamInfoPos +
+                packetIndexStreamInfos[0].streamOffset
+            );
+
+            // All supplied KTMDLs use uint16 indices.
+            ushort packetIndices[packetIndexStreamInfos[0].numVertex];
+        }
+#endif
+    }
+}
+
+FSeek(ktBase + header.size);
