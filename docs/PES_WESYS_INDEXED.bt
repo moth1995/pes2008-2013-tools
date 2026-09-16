@@ -1,0 +1,168 @@
+// PES WESYS Indexed Container - 010 Editor Binary Template
+//
+// Confirmed wrapper:
+//   00 01 00 "WESYS"
+//
+// Layout:
+//   +00 u8 unknown00          // observed 0
+//   +01 u8 variant           // observed 1
+//   +02 u8 type              // 0 = indexed (empirical)
+//   +03 char magic[5]        // "WESYS"
+//   +08 u32 payloadSize      // observed == FileSize()-0x10
+//   +0C u32 reserved         // observed 0
+//
+// Indexed payload at +0x10:
+//   +00 u32 numberOfEntries
+//   +04 u32 ofsEntries       // observed 8
+//   +08 WESYSFileEntry[]
+//
+// Entry:
+//   u32 offset
+//   u32 size
+//   u32 nameOffset
+//
+// offset / nameOffset are relative to +0x10.
+//
+// Terminology notes:
+//   offset,size         : IDA kt_fs terminology
+//   numberOfEntries    : IDA runtime vfsFileTable terminology
+//   ofsEntries         : inferred name following kt_fs serialized naming style
+//   nameOffset         : behavior confirmed; exact IDA field name unavailable
+//
+// ---------------------------------------------------------------------------
+
+LittleEndian();
+
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+int CStringSizeAt(int64 pos)
+{
+    local int64 oldPos = FTell();
+    local int n = 0;
+    local ubyte c;
+
+    FSeek(pos);
+
+    while (!FEof())
+    {
+        c = ReadUByte(FTell());
+        FSeek(FTell() + 1);
+        n++;
+
+        if (c == 0)
+            break;
+    }
+
+    FSeek(oldPos);
+    return n;
+}
+
+typedef struct
+{
+    char value[CStringSizeAt(FTell())];
+} CStringView;
+
+// WESYS indexed record.
+//
+// offset/size terminology matches the kt_fs::FileBody / kt_fs::vfsFile
+// terminology present in the PES 2008 IDA type dump.
+//
+// nameOffset is proven from PES samples, but that exact serialized field name
+// is not present in the IDA dump.
+typedef struct
+{
+    uint offset;
+    uint size;
+    uint nameOffset;
+} WESYSFileEntry;
+
+
+if (FileSize() < 0x18)
+{
+    Warning("File too small for indexed WESYS.");
+    return;
+}
+
+if (ReadUByte(0) != 0x00 ||
+    ReadUByte(1) != 0x01 ||
+    ReadUByte(2) != 0x00 ||
+    ReadUByte(3) != 'W' ||
+    ReadUByte(4) != 'E' ||
+    ReadUByte(5) != 'S' ||
+    ReadUByte(6) != 'Y' ||
+    ReadUByte(7) != 'S')
+{
+    Warning("Not a 00 01 00 WESYS indexed container.");
+    return;
+}
+
+ubyte unknown00;
+ubyte variant;
+ubyte type;
+char magic[5];
+
+uint payloadSize;
+uint reserved;
+
+local int64 payloadBase = 0x10;
+
+uint numberOfEntries;
+uint ofsEntries;
+
+if (payloadSize != FileSize() - payloadBase)
+    Warning("payloadSize != FileSize()-0x10.");
+
+if (reserved != 0)
+    Warning("reserved field is non-zero.");
+
+if (ofsEntries != 8)
+    Warning("Unexpected ofsEntries; known PES samples use 8.");
+
+if (numberOfEntries > 1000000)
+{
+    Warning("Implausible numberOfEntries.");
+    return;
+}
+
+if (payloadBase + ofsEntries + numberOfEntries * 12 > FileSize())
+{
+    Warning("Entry table exceeds file size.");
+    return;
+}
+
+FSeek(payloadBase + ofsEntries);
+
+if (numberOfEntries > 0)
+    WESYSFileEntry entries[numberOfEntries];
+
+local int i;
+
+for (i = 0; i < numberOfEntries; i++)
+{
+    local int64 childPos = payloadBase + entries[i].offset;
+
+    if (entries[i].size > 0 &&
+        childPos >= payloadBase &&
+        childPos + entries[i].size <= FileSize())
+    {
+        FSeek(childPos);
+        ubyte childData[entries[i].size];
+    }
+
+    if (entries[i].nameOffset != 0 &&
+        entries[i].nameOffset != 0xFFFFFFF0)
+    {
+        local int64 namePos = payloadBase + entries[i].nameOffset;
+
+        if (namePos >= payloadBase && namePos < FileSize())
+        {
+            FSeek(namePos);
+            CStringView name;
+        }
+    }
+}
+
+FSeek(FileSize());

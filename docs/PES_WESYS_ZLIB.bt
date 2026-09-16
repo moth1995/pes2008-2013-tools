@@ -1,0 +1,64 @@
+// PES WESYS Deflated/Zlib Wrapper - 010 Editor Binary Template
+//
+// Confirmed forms:
+//   00 01 01 "WESYS"
+//   00 00 01 "WESYS"
+//
+// Layout:
+//   +00 u8 unknown00
+//   +01 u8 variant
+//   +02 u8 type              // 1 = deflated/zlib (empirical)
+//   +03 char magic[5]        // "WESYS"
+//   +08 u32 deflatedSize
+//   +0C u32 inflatedSize
+//   +10 u8  deflatedData[deflatedSize]
+//
+// deflatedSize/inflatedSize use exact terminology found in the PES 2008 IDA
+// kt_fs::BlockZLib / ZLibDecoder types.
+//
+// ---------------------------------------------------------------------------
+
+LittleEndian();
+
+if (FileSize() < 0x10)
+{
+    Warning("File too small for WESYS deflated wrapper.");
+    return;
+}
+
+if (ReadUByte(0) != 0x00 ||
+    ReadUByte(2) != 0x01 ||
+    (ReadUByte(1) != 0x00 && ReadUByte(1) != 0x01) ||
+    ReadUByte(3) != 'W' ||
+    ReadUByte(4) != 'E' ||
+    ReadUByte(5) != 'S' ||
+    ReadUByte(6) != 'Y' ||
+    ReadUByte(7) != 'S')
+{
+    Warning("Not a recognized WESYS deflated wrapper.");
+    return;
+}
+
+ubyte unknown00;
+ubyte variant;
+ubyte type;
+char magic[5];
+
+uint deflatedSize;
+uint inflatedSize;
+
+if (deflatedSize == 0)
+    Warning("deflatedSize is zero.");
+
+if (0x10 + deflatedSize > FileSize())
+{
+    Warning("Deflated data exceeds file size.");
+    return;
+}
+
+ubyte deflatedData[deflatedSize];
+
+if (FTell() < FileSize())
+    ubyte alignmentPadding[FileSize() - FTell()];
+
+FSeek(FileSize());

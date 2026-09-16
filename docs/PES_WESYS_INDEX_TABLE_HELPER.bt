@@ -1,0 +1,35 @@
+// PES WESYS Indexed Table Helper - 010 Editor Binary Template
+//
+// Run this on a stripped WESYS indexed payload.
+//
+// Terminology aligns with PES 2008 kt_fs types where possible.
+//
+// ---------------------------------------------------------------------------
+
+LittleEndian();
+
+typedef struct
+{
+    uint offset;
+    uint size;
+    uint nameOffset;
+} WESYSFileEntry;
+
+local int64 payloadBase = FTell();
+
+uint numberOfEntries;
+uint ofsEntries;
+
+if (numberOfEntries > 1000000)
+{
+    Warning("Implausible numberOfEntries.");
+    return;
+}
+
+if (ofsEntries != 8)
+    Warning("Unexpected ofsEntries; known PES samples use 8.");
+
+FSeek(payloadBase + ofsEntries);
+
+if (numberOfEntries > 0)
+    WESYSFileEntry entries[numberOfEntries];
