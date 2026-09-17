@@ -464,6 +464,77 @@ int DetectVertexLayout( int64 d, int count, int stride )
     return KT_LAYOUT_UNKNOWN;
 }
 
+typedef struct
+{
+    /// <summary>
+    /// Value at row 1, column 1 of the matrix.
+    /// </summary>
+    float M11;
+    /// <summary>
+    /// Value at row 1, column 2 of the matrix.
+    /// </summary>
+    float M12;
+    /// <summary>
+    /// Value at row 1, column 3 of the matrix.
+    /// </summary>
+    float M13;
+    /// <summary>
+    /// Value at row 1, column 4 of the matrix.
+    /// </summary>
+    float M14;
+
+    /// <summary>
+    /// Value at row 2, column 1 of the matrix.
+    /// </summary>
+    float M21;
+    /// <summary>
+    /// Value at row 2, column 2 of the matrix.
+    /// </summary>
+    float M22;
+    /// <summary>
+    /// Value at row 2, column 3 of the matrix.
+    /// </summary>
+    float M23;
+    /// <summary>
+    /// Value at row 2, column 4 of the matrix.
+    /// </summary>
+    float M24;
+
+    /// <summary>
+    /// Value at row 3, column 1 of the matrix.
+    /// </summary>
+    float M31;
+    /// <summary>
+    /// Value at row 3, column 2 of the matrix.
+    /// </summary>
+    float M32;
+    /// <summary>
+    /// Value at row 3, column 3 of the matrix.
+    /// </summary>
+    float M33;
+    /// <summary>
+    /// Value at row 3, column 4 of the matrix.
+    /// </summary>
+    float M34;
+
+    /// <summary>
+    /// Value at row 4, column 1 of the matrix.
+    /// </summary>
+    float M41;
+    /// <summary>
+    /// Value at row 4, column 2 of the matrix.
+    /// </summary>
+    float M42;
+    /// <summary>
+    /// Value at row 4, column 3 of the matrix.
+    /// </summary>
+    float M43;
+    /// <summary>
+    /// Value at row 4, column 4 of the matrix.
+    /// </summary>
+    float M44;
+} Matrix4x4;
+
 // ---------------------------------------------------------------------------
 // Core KTMDL structures
 // Names below match the PES 2008 IDA type dump where available.
@@ -547,8 +618,8 @@ typedef struct
     uint64 nameId;
     uint64 pad0;
 
-    float matrix[4][4];
-    float invertMatrix[4][4];
+    Matrix4x4 matrix;
+    Matrix4x4 invertMatrix;
 
     float bound_max[3];
     uint pad1;
@@ -651,7 +722,7 @@ typedef struct
     int parentNo;
     uint pad;
 
-    float matrix[4][4];
+    Matrix4x4 matrix;
 } ktModelDataLocator;                   // 0x50
 
 typedef struct
@@ -664,7 +735,7 @@ typedef struct
 
     uint pad2[2];
 
-    float param[8][4];
+    float param[8*4];
 } ktModelDataMaterial;                  // 0xA0
 
 typedef struct
@@ -680,7 +751,7 @@ typedef struct
 
     ushort textureIndex;
 
-    float param[4][4];
+    float param[4*4];
 } ktModelDataTextureType;               // 0x50
 
 typedef struct
@@ -906,7 +977,7 @@ local int   gVertexLayout;
 
 typedef struct
 {
-#if PARSE_TYPED_VERTEX_BUFFERS
+#ifdef PARSE_TYPED_VERTEX_BUFFERS
     if (gVertexLayout == KT_LAYOUT_32_STATIC)
         KTVertex32Static vertices[gVertexCount];
     else if (gVertexLayout == KT_LAYOUT_36_RIGID)
@@ -1169,7 +1240,7 @@ if (header.debugInfoOffset > 0 &&
 
         uint textureNameOffsets[header.textureNameIdCount];
 
-#if PARSE_NAME_STRINGS
+#ifdef PARSE_NAME_STRINGS
         for (i = 0; i < header.textureNameIdCount; i++)
         {
             FSeek(textureNameOffsetBase + textureNameOffsets[i]);
@@ -1195,7 +1266,7 @@ if (header.debugInfoOffset > 0 &&
 
         uint shaderNameOffsets[debugNames.shaderNameCount];
 
-#if PARSE_NAME_STRINGS
+#ifdef PARSE_NAME_STRINGS
         for (i = 0; i < debugNames.shaderNameCount; i++)
         {
             FSeek(shaderNameOffsetBase + shaderNameOffsets[i]);
@@ -1289,7 +1360,7 @@ for (i = 0; i < header.packetCount; i++)
             packets[i].indexCount
         ];
 
-#if PARSE_INDEX_BUFFERS
+#ifdef PARSE_INDEX_BUFFERS
         if (packetIndexStreamInfos[0].type == KT_STREAM_INDEX &&
             packetIndexStreamInfos[0].numVertex > 0)
         {
