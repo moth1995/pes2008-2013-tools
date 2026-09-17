@@ -347,7 +347,184 @@ def _assign_skinning(obj, packet, bone_names, implicit_mode):
     return assigned
 
 
-def _create_section_material(model, packet):
+TEXTURE_FILE_EXTENSIONS = (
+    ".dds",
+    ".png",
+    ".tga",
+    ".bmp",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".exr",
+    ".hdr",
+    ".webp",
+    ".psd",
+)
+
+
+def _texture_basename(value):
+    """Return a case-folded texture base name, deliberately ignoring the KTMDL extension.
+
+    PES debug names often carry logical/game extensions such as .psd or .pic.  The
+    sibling file used by Blender may instead be .dds/.png/.tga/etc., so extension
+    matching is intentionally not part of texture resolution.
+    """
+    if not value:
+        return ""
+    name = os.path.basename(str(value).strip().replace("\\", "/"))
+    return os.path.splitext(name)[0].casefold()
+
+
+def _build_texture_file_index(ktmdl_filepath):
+    """Index image files next to the imported KTMDL by basename (case-insensitive)."""
+    folder = os.path.dirname(os.path.abspath(ktmdl_filepath))
+    out = {}
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return out
+    priority = {ext: i for i, ext in enumerate(TEXTURE_FILE_EXTENSIONS)}
+    for name in names:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        stem, ext = os.path.splitext(name)
+        ext = ext.casefold()
+        if ext not in priority:
+            continue
+        out.setdefault(stem.casefold(), []).append(path)
+    for paths in out.values():
+        paths.sort(
+            key=lambda x: (
+                priority.get(os.path.splitext(x)[1].casefold(), 999),
+                os.path.basename(x).casefold(),
+            )
+        )
+    return out
+
+
+def _texture_id_name_candidates(model, tt):
+    """Fallback basename candidates for archives that name textures by IDs/hashes."""
+    candidates = []
+    tex_index = int(tt.get("textureIndex", -1))
+    if 0 <= tex_index < len(model.get("textureNameIds", [])):
+        tex_id = model["textureNameIds"][tex_index]
+        hi = int(tex_id.get("hi", 0))
+        lo = int(tex_id.get("lo", 0))
+        candidates.extend(
+            (
+                "%016x%016x" % (hi, lo),
+                "%016x_%016x" % (hi, lo),
+                "%016x-%016x" % (hi, lo),
+                "%016x" % hi,
+                "%016x" % lo,
+            )
+        )
+    try:
+        candidates.append("%016x" % int(tt.get("nameId", 0)))
+    except Exception:
+        pass
+    return [c.casefold() for c in candidates if c and set(c) != {"0"}]
+
+
+def _resolve_texture_file(model, tt, texture_file_index):
+    """Resolve one KTMDL texture to a sibling image without trusting its extension."""
+    candidates = []
+    logical = _texture_basename(tt.get("textureName"))
+    if logical:
+        candidates.append(logical)
+    candidates.extend(_texture_id_name_candidates(model, tt))
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        paths = texture_file_index.get(candidate)
+        if paths:
+            return paths[0], candidate
+    return None, (candidates[0] if candidates else "")
+
+
+def _load_texture_image(path):
+    if not path:
+        return None
+    try:
+        return bpy.data.images.load(path, check_existing=True)
+    except Exception:
+        return None
+
+
+def _socket(node, *names):
+    for name in names:
+        try:
+            found = node.inputs.get(name)
+            if found is not None:
+                return found
+        except Exception:
+            pass
+    return None
+
+
+def _first_node(nodes, bl_idname):
+    for node in nodes:
+        if getattr(node, "bl_idname", "") == bl_idname:
+            return node
+    return None
+
+
+def _ensure_material_core(mat):
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    output = _first_node(nodes, "ShaderNodeOutputMaterial")
+    if output is None:
+        output = nodes.new("ShaderNodeOutputMaterial")
+    output.name = "KTMDL_MaterialOutput"
+    output.location = (760, 80)
+    bsdf = _first_node(nodes, "ShaderNodeBsdfPrincipled")
+    if bsdf is None:
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.name = "KTMDL_Principled"
+    bsdf.location = (470, 80)
+    surface = _socket(output, "Surface")
+    if surface is not None:
+        for link in list(surface.links):
+            links.remove(link)
+        try:
+            links.new(bsdf.outputs.get("BSDF"), surface)
+        except Exception:
+            pass
+    return bsdf, output
+
+
+def _uv_node(nodes, uv_nodes, uv_no, packet):
+    if uv_no in uv_nodes:
+        return uv_nodes[uv_no]
+    if uv_no < 0 or uv_no > 3:
+        return None
+    semantic = "TEXCOORD%d" % uv_no
+    verts = packet.get("vertices", [])
+    if not verts or semantic not in verts[0]:
+        return None
+    node = nodes.new("ShaderNodeUVMap")
+    node.name = "KTMDL_UV%d" % uv_no
+    node.label = "KTMDL UV%d" % uv_no
+    node.uv_map = "UV%d" % uv_no
+    node.location = (-900, 300 - 150 * uv_no)
+    uv_nodes[uv_no] = node
+    return node
+
+
+def _set_non_color(image):
+    if image is None:
+        return
+    try:
+        image.colorspace_settings.name = "Non-Color"
+    except Exception:
+        pass
+
+
+def _create_section_material(model, packet, texture_file_index):
     mi = packet["materialNo"]
     src = model["materials"][mi] if 0 <= mi < len(model["materials"]) else None
     base = _safe_name(src.get("name") if src else None, "material_%03d" % mi)
@@ -356,36 +533,74 @@ def _create_section_material(model, packet):
     _set_prop(mat, "ktmdl_packet_index", packet["index"])
     _set_prop(mat, "ktmdl_source_material_index", mi)
     if src:
-        for k in ("nameId", "pad", "nParam", "shaderId", "pad2", "param", "shaderName"):
+        for k in (
+            "nameId",
+            "nameIdHex",
+            "pad",
+            "padHex",
+            "nParam",
+            "shaderId",
+            "shaderIdHex",
+            "pad2",
+            "param",
+            "shaderName",
+        ):
             _set_prop(mat, "ktmdl_" + k, src.get(k))
-        try:
-            rgb = src["param"][0]
-            mat.diffuse_color = (float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0)
-        except Exception:
-            pass
+    # Material param[8][4] has shader-specific semantics.  Do not reinterpret
+    # param[0] as RGB; keep every vector as metadata until those shaders are RE'd.
     nodes = mat.node_tree.nodes
-    y = 260
+    links = mat.node_tree.links
+    bsdf, _output = _ensure_material_core(mat)
+    uv_nodes = {}
+    texture_nodes = []
+    loaded = 0
+    missing = []
+    y = 300
     for ri, ref in enumerate(packet.get("activeTextureRefs", [])):
         ti = ref["id"]
         if ti < 0 or ti >= len(model["textureTypes"]):
             continue
         tt = model["textureTypes"][ti]
+        tex_id = None
+        tex_index = int(tt.get("textureIndex", -1))
+        if 0 <= tex_index < len(model.get("textureNameIds", [])):
+            tex_id = model["textureNameIds"][tex_index]
         node = nodes.new("ShaderNodeTexImage")
         node.name = "KTMDL_%s_%02d" % (tt.get("modeName", "TEXTURE"), ri)
-        node.label = "%s | %s | UV%d | texParam %d" % (
+        node.label = "%s | %s | UV%s | texParam %d" % (
             tt.get("textureName", "texture"),
             tt.get("modeName", "UNKNOWN"),
             ref["uvNo"],
             ref["texParam"],
         )
-        node.location = (-520, y)
+        node.location = (-560, y)
         y -= 220
+        resolved, resolution_key = _resolve_texture_file(model, tt, texture_file_index)
+        image = _load_texture_image(resolved)
+        if image is not None:
+            node.image = image
+            loaded += 1
+        else:
+            missing.append(tt.get("textureName") or "texture_%03d" % tex_index)
+        mode = int(tt.get("mode", -1))
+        uv_no = int(ref.get("uvNo", 0))
+        if mode in (1, 2, 3, 4):
+            _set_non_color(image)
+        uv = _uv_node(nodes, uv_nodes, uv_no, packet)
+        if uv is not None:
+            try:
+                links.new(uv.outputs.get("UV"), node.inputs.get("Vector"))
+            except Exception:
+                pass
         for k, v in (
             ("ktmdl_texture_name", tt.get("textureName")),
             ("ktmdl_texture_type_index", ti),
-            ("ktmdl_texture_index", tt["textureIndex"]),
-            ("ktmdl_mode", tt["mode"]),
-            ("ktmdl_uv_no", ref["uvNo"]),
+            ("ktmdl_texture_index", tex_index),
+            ("ktmdl_texture_type_name_id", tt.get("nameId")),
+            ("ktmdl_texture_type_name_id_hex", tt.get("nameIdHex")),
+            ("ktmdl_mode", mode),
+            ("ktmdl_mode_name", tt.get("modeName")),
+            ("ktmdl_uv_no", uv_no),
             ("ktmdl_tex_param", ref["texParam"]),
             ("ktmdl_addr_u", tt["addrU"]),
             ("ktmdl_addr_v", tt["addrV"]),
@@ -393,8 +608,104 @@ def _create_section_material(model, packet):
             ("ktmdl_filter_min", tt["filterMin"]),
             ("ktmdl_filter_mip", tt["filterMip"]),
             ("ktmdl_param", tt["param"]),
+            ("ktmdl_resolved_texture_path", resolved or ""),
+            ("ktmdl_texture_resolution_key", resolution_key),
+            ("ktmdl_image_loaded", image is not None),
         ):
             _set_prop(node, k, v)
+        if tex_id:
+            for k in ("hi", "hiHex", "lo", "loHex", "rawHex"):
+                _set_prop(node, "ktmdl_texture_id_" + k, tex_id.get(k))
+        texture_nodes.append((node, mode, uv_no, ref, tt))
+
+    base_input = _socket(bsdf, "Base Color")
+    normal_input = _socket(bsdf, "Normal")
+    spec_input = _socket(bsdf, "Specular IOR Level", "Specular")
+    diffuse_nodes = [x for x in texture_nodes if x[1] == 0]
+    normal_nodes = [x for x in texture_nodes if x[1] == 1]
+    spec_nodes = [x for x in texture_nodes if x[1] == 2]
+    ao_nodes = [x for x in texture_nodes if x[1] == 3]
+
+    # First color/diffuse texture is the conservative Level-1 base.  Extra color
+    # layers remain present but uncombined because texParam blend semantics are
+    # still unknown and should not be invented.
+    diffuse_output = None
+    if diffuse_nodes:
+        diffuse_output = diffuse_nodes[0][0].outputs.get("Color")
+        _set_prop(diffuse_nodes[0][0], "ktmdl_link_status", "base_color")
+        for extra in diffuse_nodes[1:]:
+            _set_prop(
+                extra[0], "ktmdl_link_status", "unlinked_extra_color_texparam_unknown"
+            )
+
+    # AO is an approximation: multiply the first AO texture with the first base
+    # color texture.  It is deliberately only used when a diffuse source exists.
+    if diffuse_output is not None and ao_nodes and base_input is not None:
+        mix = nodes.new("ShaderNodeMixRGB")
+        mix.name = "KTMDL_AO_Multiply"
+        mix.label = "KTMDL AO x Base Color"
+        mix.blend_type = "MULTIPLY"
+        mix.inputs[0].default_value = 1.0
+        mix.location = (160, 250)
+        try:
+            links.new(diffuse_output, mix.inputs[1])
+            links.new(ao_nodes[0][0].outputs.get("Color"), mix.inputs[2])
+            links.new(mix.outputs.get("Color"), base_input)
+        except Exception:
+            pass
+        _set_prop(ao_nodes[0][0], "ktmdl_link_status", "ao_multiply_approximation")
+        for extra in ao_nodes[1:]:
+            _set_prop(extra[0], "ktmdl_link_status", "unlinked_extra_ao")
+    elif diffuse_output is not None and base_input is not None:
+        try:
+            links.new(diffuse_output, base_input)
+        except Exception:
+            pass
+
+    if normal_nodes and normal_input is not None:
+        normal = nodes.new("ShaderNodeNormalMap")
+        normal.name = "KTMDL_NormalMap"
+        normal.label = "KTMDL Normal Map"
+        normal.location = (180, -120)
+        try:
+            links.new(
+                normal_nodes[0][0].outputs.get("Color"), normal.inputs.get("Color")
+            )
+            links.new(normal.outputs.get("Normal"), normal_input)
+        except Exception:
+            pass
+        _set_prop(normal_nodes[0][0], "ktmdl_link_status", "normal_map")
+        for extra in normal_nodes[1:]:
+            _set_prop(extra[0], "ktmdl_link_status", "unlinked_extra_normal")
+
+    if spec_nodes and spec_input is not None:
+        bw = nodes.new("ShaderNodeRGBToBW")
+        bw.name = "KTMDL_SpecularToValue"
+        bw.label = "KTMDL Specular (approx.)"
+        bw.location = (180, -370)
+        try:
+            links.new(spec_nodes[0][0].outputs.get("Color"), bw.inputs.get("Color"))
+            links.new(bw.outputs.get("Val"), spec_input)
+        except Exception:
+            pass
+        _set_prop(spec_nodes[0][0], "ktmdl_link_status", "specular_approximation")
+        for extra in spec_nodes[1:]:
+            _set_prop(extra[0], "ktmdl_link_status", "unlinked_extra_specular")
+
+    # Reflection and special/generated UV modes are intentionally preserved but
+    # not guessed here.  They belong to the Level-2 shader reverse engineering.
+    for node, mode, uv_no, _ref, _tt in texture_nodes:
+        if not node.get("ktmdl_link_status"):
+            if uv_no > 3:
+                _set_prop(node, "ktmdl_link_status", "unlinked_special_uv_%d" % uv_no)
+            elif mode == 4:
+                _set_prop(
+                    node, "ktmdl_link_status", "unlinked_reflection_semantics_unknown"
+                )
+            else:
+                _set_prop(node, "ktmdl_link_status", "unlinked")
+    _set_prop(mat, "ktmdl_loaded_texture_count", loaded)
+    _set_prop(mat, "ktmdl_missing_texture_names", missing)
     return mat
 
 
@@ -559,6 +870,7 @@ def _create_mesh_object(
     arm_obj,
     bone_names,
     implicit_mode,
+    texture_file_index,
 ):
     verts = packet["vertices"]
     positions_raw = [v.get("POSITION") for v in verts]
@@ -606,7 +918,7 @@ def _create_mesh_object(
                 _create_point_float_attribute(
                     mesh, "KT_WEIGHT%d" % c, [v["BLENDWEIGHT"][c] for v in verts]
                 )
-    mat = _create_section_material(model, packet)
+    mat = _create_section_material(model, packet, texture_file_index)
     mesh.materials.append(mat)
     assigned = _assign_skinning(obj, packet, bone_names, implicit_mode)
     _set_prop(obj, "ktmdl_skin_assignments", assigned)
@@ -636,6 +948,7 @@ def import_ktmdl(
     collection = bpy.data.collections.new(stem)
     context.scene.collection.children.link(collection)
     basis = _basis_matrix(coordinate_mode)
+    texture_file_index = _build_texture_file_index(filepath)
     arm_obj, bone_names = (None, {})
     if create_armature and model["bones"]:
         arm_obj, bone_names = _create_armature(context, collection, model, basis, scale)
@@ -645,7 +958,7 @@ def import_ktmdl(
                 ("ktmdl_coordinate_mode", coordinate_mode),
                 ("ktmdl_import_scale", float(scale)),
                 ("ktmdl_implicit_weight_mode", implicit_weight_mode),
-                ("ktmdl_importer_version", "1.0.0"),
+                ("ktmdl_importer_version", "1.2.0"),
             ):
                 _set_prop(arm_obj, k, v)
     objects = []
@@ -663,6 +976,7 @@ def import_ktmdl(
                 arm_obj,
                 bone_names,
                 implicit_weight_mode,
+                texture_file_index,
             )
         )
     if import_bounds:
