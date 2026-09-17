@@ -446,7 +446,7 @@ def _create_locators(parent_collection, model, basis, scale, arm_obj, bone_names
             "locator_%03d_%016X" % (loc["index"], loc["nameId"]), None
         )
         col.objects.link(obj)
-        obj.empty_display_type = "AXES"
+        obj.empty_display_type = "PLAIN_AXES"
         obj.empty_display_size = max(0.03 * scale, 0.001)
         obj.matrix_world = _transform_matrix(loc["matrix"], basis, scale)
         _set_prop(obj, "ktmdl_collection_name", parent_collection.name)
